@@ -208,6 +208,8 @@ We're just going to create symlinks. By doing so you don't have to think about
 copy files, just rebuild and you have the latest version available for the next
 boot. On my computer I've symlinked like this (in my `/tftpboot` folder):
 ```
+$ ll
+lrwxrwxrwx  1 jbech  jbech         65 jul 14 09:03 Image -> /home/jbech/devel/optee_projects/rpi3/linux/arch/arm64/boot/Image
 lrwxrwxrwx  1 jbech  jbech         85 jul 14 09:03 optee.bin -> /home/jbech/devel/optee_projects/rpi3/arm-trusted-firmware/build/rpi3/debug/optee.bin
 lrwxrwxrwx  1 jbech  jbech         90 Sep 13 11:19 bcm2710-rpi-3-b.dtb -> /home/jbech/devel/optee_projects/rpi3/linux/arch/arm64/boot/dts/broadcom/bcm2710-rpi-3-b.dtb
 ```
