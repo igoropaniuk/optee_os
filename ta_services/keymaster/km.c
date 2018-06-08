@@ -44,3 +44,21 @@ cleanup_return:
 	return res;
 }
 
+TEE_Result km_generate_key(uint8_t *key_data,
+			   const size_t key_size,
+			   struct keymaster_key_characteristics_t key_char,
+			   enum keymaster_digest_t key_digest,
+			   enum keymaster_algorithm_t key_algo)
+{
+	return TEE_ERROR_NOT_IMPLEMENTED;
+}
+
+
+TEE_Result km_import_key(uint8_t *key_data,
+			   const size_t key_size,
+			   struct keymaster_key_characteristics_t *key_char,
+			   enum keymaster_digest_t key_digest,
+			   enum keymaster_algorithm_t key_algo)
+{
+	return TEE_ERROR_NOT_IMPLEMENTED;
+}
