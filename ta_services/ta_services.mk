@@ -1,9 +1,3 @@
-.PHONY: all
-all: ta_dev_kit
-
-.PHONY: clean
-clean:
-
 ta_flags_32 := CROSS_COMPILE="$(CROSS_COMPILE32)" \
 	    TA_DEV_KIT_DIR="$(CURDIR)/$(out-dir)/export-ta_arm32"
 
