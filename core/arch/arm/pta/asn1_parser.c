@@ -25,70 +25,46 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <crypto/crypto.h>
 #include <kernel/pseudo_ta.h>
+#include <pta_asn1_parser.h>
 #include <tee_api_types.h>
 #include <tee_api_defines.h>
+#include <tee/tee_cryp_utl.h>
 #include <tomcrypt.h>
 #include <trace.h>
-#include <crypto/crypto.h>
-#include "mpa.h"
-#include "x509_attestation.h"
-#include "keymaster_defs.h"
 
-#include <tee/tee_cryp_utl.h>
+#include "mpa.h"
+#include "keymaster_defs.h"
+#include "x509_attestation.h"
 
 #define TA_NAME		"asn1_parser.ta"
+#define TA_PRINT_PREFIX	"ASN1_Parser: "
 
-#define ASN1_PARSER_UUID \
-		{ 0x273fcb14, 0xe831, 0x4cf2, \
-			{ 0x93, 0xc4, 0x76, 0x15, 0xdb, 0xd3, 0x0e, 0x90 } }
+#define ATTR_COUNT_RSA			8
+#define ATTR_COUNT_EC			3
+#define MAX_OCTET_COUNT			10
 
-#define ATTR_COUNT_RSA 8
-#define ATTR_COUNT_EC 3
-#define MAX_OCTET_COUNT 10
+#define ALGORITHM_RSA			1
+#define ALGORITHM_EC			3
 
-#define ALGORITHM_RSA 1
-#define ALGORITHM_EC 3
+#define MAX_HEADER_SIZE			4
+#define CODE_SEQUENCE			0x30
+#define CODE_SET			0x31
+#define LONG_MASK			0x80
+#define EDGE_SHORT			128
+#define MAX_OID_SIZE			32
 
-#define KM_ERROR_UNSUPPORTED_KEY_ENCRYPTION_ALGORITHM -19
-#define KM_ERROR_INSUFFICIENT_BUFFER_SPACE -29
-#define KM_ERROR_MEMORY_ALLOCATION_FAILED -41
-#define KM_ERROR_INVALID_ARGUMENT -38
-#define KM_ERROR_UNIMPLEMENTED -100
-#define KM_ERROR_UNKNOWN_ERROR -1000
+#define EC_KEY_SIZE_NIST_224		224
+#define EC_KEY_SIZE_NIST_256		256
+#define EC_KEY_SIZE_NIST_384		384
+#define EC_KEY_SIZE_NIST_521		521
 
-#define CMD_ASN1_DECODE 0
-#define CMD_ASN1_ENCODE_PUBKEY 1
-#define CMD_EC_SIGN_ENCODE 2
-#define CMD_EC_SIGN_DECODE 3
-#define CMD_ASN1_GEN_ROOT_RSA_CERT 4
-#define CMD_ASN1_GEN_ROOT_EC_CERT 5
-#define CMD_ASN1_GEN_ATT_RSA_CERT 6
-#define CMD_ASN1_GEN_ATT_EC_CERT 7
-
-#define MAX_HEADER_SIZE 4
-#define CODE_SEQUENCE 0x30
-#define CODE_SET 0x31
-#define LONG_MASK 0x80
-#define EDGE_SHORT 128
-#define MAX_OID_SIZE 32
-
-#define EC_KEY_SIZE_NIST_224 224
-#define EC_KEY_SIZE_NIST_256 256
-#define EC_KEY_SIZE_NIST_384 384
-#define EC_KEY_SIZE_NIST_521 521
-
-#define RSA_KEY_SIZE 1024U
-#define EC_KEY_SIZE 256U
-
-#define RSA_MAX_KEY_SIZE 4096U
-#define EC_MAX_KEY_SIZE 521U
-
-#define RSA_KEY_BUFFER_SIZE (RSA_KEY_SIZE / 8)
+#define RSA_KEY_BUFFER_SIZE (MAX_RSA_SIZE / 8)
 #define EC_KEY_BUFFER_SIZE (EC_KEY_SIZE / 8)
 
-#define RSA_MAX_KEY_BUFFER_SIZE (RSA_MAX_KEY_SIZE / 8)
-#define EC_MAX_KEY_BUFFER_SIZE (EC_MAX_KEY_SIZE / 8 + 1)
+#define RSA_MAX_KEY_BUFFER_SIZE (MAX_RSA_SIZE / 8)
+#define EC_MAX_KEY_BUFFER_SIZE (LTC_MAX_ECC / 8 + 1)
 
 #define ROOT_CERT_BUFFER_SIZE 4096U
 #define ATTEST_CERT_BUFFER_SIZE 4096U
@@ -150,7 +126,7 @@ static const uint32_t oid_ec2_prime_c = 7;
 
 static uint8_t hash_sha256[SHA256_BUFFER_SIZE];
 
-static int TA_iterate_asn1_list(ltc_asn1_list *list,
+static int iterate_asn1_list(ltc_asn1_list *list,
 				const uint32_t level,
 				struct import_data_t *imp_data)
 {
@@ -160,18 +136,19 @@ static int TA_iterate_asn1_list(ltc_asn1_list *list,
 	while (list != NULL) {
 		switch (list->type) {
 		case LTC_ASN1_SEQUENCE:
-			res = TA_iterate_asn1_list(list->child,
+			res = iterate_asn1_list(list->child,
 						level + 1, imp_data);
 			if (res != CRYPT_OK)
 				goto out;
 			break;
 		case LTC_ASN1_OBJECT_IDENTIFIER:
-			if (level != 2 || (imp_data->obj1_length != 0
-						&& imp_data->obj2_length != 0))
+			if (level != 2 || (imp_data->obj1_length != 0 &&
+					   imp_data->obj2_length != 0))
 				break;
+
 			if (imp_data->obj1_length == 0) {
 				memcpy(imp_data->obj_ident1, list->data,
-						list->size * sizeof(uint64_t));
+				       list->size * sizeof(uint64_t));
 				imp_data->obj1_length = list->size;
 			} else {
 				memcpy(imp_data->obj_ident2, list->data,
@@ -184,7 +161,7 @@ static int TA_iterate_asn1_list(ltc_asn1_list *list,
 				break;
 			data = malloc(list->size);
 			if (!data) {
-				res = KM_ERROR_MEMORY_ALLOCATION_FAILED;
+				res = TEE_ERROR_OUT_OF_MEMORY;
 				EMSG("Failed to allocate memory for octet string buffer");
 				goto out;
 			}
@@ -201,56 +178,59 @@ out:
 	return res;
 }
 
-static int TA_check_object_identifier(const struct import_data_t *imp_data,
-						const uint32_t algorithm,
-						uint32_t *key_size)
+static int check_object_identifier(const struct import_data_t *imp_data,
+				   const uint32_t algorithm,
+				   uint32_t *key_size)
 {
 	int32_t cmp_res = 0;
 	const uint64_t *exp_ident = NULL;
 
 	if (imp_data->obj1_length == 0) {
 		EMSG("Object identifier of imported key is empty");
-		return KM_ERROR_UNSUPPORTED_KEY_ENCRYPTION_ALGORITHM;
+		return TEE_ERROR_NOT_SUPPORTED;
 	}
-	if (algorithm == ALGORITHM_RSA) {
+
+	if (algorithm == ALGORITHM_RSA)
 		exp_ident = identifier_rsa;
-	} else {
+	else
 		exp_ident = identifier_ec;
-	}
 
 	cmp_res = memcmp(exp_ident, imp_data->obj_ident1,
 				imp_data->obj1_length * sizeof(uint64_t));
 	if (cmp_res != 0) {
 		EMSG("First Object Identifier is not match expected one");
-		return KM_ERROR_UNSUPPORTED_KEY_ENCRYPTION_ALGORITHM;
+		return TEE_ERROR_NOT_SUPPORTED;
 	}
 	if (algorithm == ALGORITHM_RSA)
 		return CRYPT_OK;
+
 	/* Check second object identifier only for EC */
 	if (imp_data->obj2_length == 0) {
 		EMSG("Second Object Identifier of imported key is empty");
-		return KM_ERROR_UNSUPPORTED_KEY_ENCRYPTION_ALGORITHM;
+		return TEE_ERROR_NOT_SUPPORTED;
 	}
+
 	if (!memcmp(oid_ec2_224, imp_data->obj_ident2,
-			imp_data->obj2_length * sizeof(uint64_t))) {
+			imp_data->obj2_length * sizeof(uint64_t)))
 		*key_size = EC_KEY_SIZE_NIST_224;
-	} else if (!memcmp(oid_ec2_256, imp_data->obj_ident2,
-			imp_data->obj2_length * sizeof(uint64_t))) {
+	else if (!memcmp(oid_ec2_256, imp_data->obj_ident2,
+			imp_data->obj2_length * sizeof(uint64_t)))
 		*key_size = EC_KEY_SIZE_NIST_256;
-	} else if (!memcmp(oid_ec2_384, imp_data->obj_ident2,
-			imp_data->obj2_length * sizeof(uint64_t))) {
+	else if (!memcmp(oid_ec2_384, imp_data->obj_ident2,
+			imp_data->obj2_length * sizeof(uint64_t)))
 		*key_size = EC_KEY_SIZE_NIST_384;
-	} else if (!memcmp(oid_ec2_521, imp_data->obj_ident2,
-			imp_data->obj2_length * sizeof(uint64_t))) {
+	else if (!memcmp(oid_ec2_521, imp_data->obj_ident2,
+			imp_data->obj2_length * sizeof(uint64_t)))
 		*key_size = EC_KEY_SIZE_NIST_521;
-	} else {
+	else {
 		EMSG("Unexpected value fo the second EC Object Identifier");
-		return KM_ERROR_UNSUPPORTED_KEY_ENCRYPTION_ALGORITHM;
+
+		return TEE_ERROR_NOT_SUPPORTED;
 	}
 	return CRYPT_OK;
 }
 
-static int TA_bits_to_bytes(struct blob *point,
+static int bits_to_bytes(struct blob *point,
 				const ltc_asn1_list *list)
 {
 	int res = CRYPT_OK;
@@ -260,7 +240,7 @@ static int TA_bits_to_bytes(struct blob *point,
 	point->data_length = list->size / 8;
 	point->data = malloc(point->data_length);
 	if (!point->data) {
-		res = KM_ERROR_MEMORY_ALLOCATION_FAILED;
+		res = TEE_ERROR_OUT_OF_MEMORY;
 		EMSG("Failed to allocate memory for bytes converted from bits");
 		goto out;
 	}
@@ -285,18 +265,19 @@ static int TA_push_to_output(uint8_t *output,
 	return offset;
 }
 
-static int getBuffer(const uint32_t size, uint8_t **buffer) {
+static int getBuffer(const uint32_t size, uint8_t **buffer)
+{
 	if (!(*buffer)) {
 		*buffer = malloc(size);
 		if (!(*buffer)) {
 			EMSG("Failed to allocate memory for BN buffer");
-			return KM_ERROR_MEMORY_ALLOCATION_FAILED;
+			return TEE_ERROR_OUT_OF_MEMORY;
 		}
 	}
 	return CRYPT_OK;
 }
 
-static int TA_iterate_asn1_attrs(const ltc_asn1_list *list,
+static int iterate_asn1_attrs(const ltc_asn1_list *list,
 				const uint32_t level,
 				uint32_t *attrs_count,
 				const uint32_t algorithm,
@@ -318,7 +299,7 @@ static int TA_iterate_asn1_attrs(const ltc_asn1_list *list,
 		switch (list->type) {
 		case LTC_ASN1_CONSTRUCTED:
 		case LTC_ASN1_SEQUENCE:
-			res = TA_iterate_asn1_attrs(list->child,
+			res = iterate_asn1_attrs(list->child,
 					level + 1, attrs_count, algorithm,
 					output, &offset, key_size);
 			if (res != CRYPT_OK)
@@ -353,12 +334,12 @@ static int TA_iterate_asn1_attrs(const ltc_asn1_list *list,
 			if (algorithm != ALGORITHM_EC ||
 						*attrs_count > ATTR_COUNT_EC)
 				break;
-			res = TA_bits_to_bytes(&point, list);
+			res = bits_to_bytes(&point, list);
 			if (res != CRYPT_OK)
 				goto out;
 			if (point.data[0] != 0x04) {
 				/* Point is not in uncompressed form*/
-				res = KM_ERROR_INVALID_ARGUMENT;
+				res = TEE_ERROR_BAD_FORMAT;
 				EMSG("Imported EC point is not uncompressed");
 				goto out;
 			}
@@ -382,14 +363,17 @@ static int TA_iterate_asn1_attrs(const ltc_asn1_list *list,
 	}
 out:
 	*output_size = offset;
+
 	if (point.data)
 		free(point.data);
+
 	if (buf)
 		free(buf);
+
 	return res;
 }
 
-static TEE_Result TA_deserialize_rsa_keypair(const uint8_t *in,
+static TEE_Result deserialize_rsa_keypair(const uint8_t *in,
 					     uint32_t in_size,
 					     struct rsa_keypair *keyPair)
 {
@@ -404,16 +388,18 @@ static TEE_Result TA_deserialize_rsa_keypair(const uint8_t *in,
 		goto out;
 	}
 
-	//Public part
+	/* Public part */
 	memcpy(&key_attr_buf_size, &in[size], sizeof(uint32_t));
 	if (key_attr_buf_size > RSA_KEY_BUFFER_SIZE) {
 		res = TEE_ERROR_BAD_PARAMETERS;
 		EMSG("Wrong memory buffer length");
 		goto out;
 	}
+
 	size += sizeof(uint32_t);
 	memcpy(tmp_key_attr_buf, &in[size], key_attr_buf_size);
 	size += key_attr_buf_size;
+
 	res = crypto_bignum_bin2bn(tmp_key_attr_buf, key_attr_buf_size,
 				       keyPair->n);
 	if (res != TEE_SUCCESS) {
@@ -427,9 +413,11 @@ static TEE_Result TA_deserialize_rsa_keypair(const uint8_t *in,
 		EMSG("Wrong memory buffer length");
 		goto out;
 	}
+
 	size += sizeof(uint32_t);
 	memcpy(tmp_key_attr_buf, &in[size], key_attr_buf_size);
 	size += key_attr_buf_size;
+
 	res = crypto_bignum_bin2bn(tmp_key_attr_buf, key_attr_buf_size,
 				       keyPair->e);
 	if (res != TEE_SUCCESS) {
@@ -437,7 +425,7 @@ static TEE_Result TA_deserialize_rsa_keypair(const uint8_t *in,
 		goto out;
 	}
 
-	//Private part:
+	/* Private part */
 	memcpy(&key_attr_buf_size, &in[size], sizeof(uint32_t));
 	if (key_attr_buf_size > RSA_KEY_BUFFER_SIZE) {
 		res = TEE_ERROR_BAD_PARAMETERS;
@@ -460,6 +448,7 @@ static TEE_Result TA_deserialize_rsa_keypair(const uint8_t *in,
 		EMSG("Wrong memory buffer length");
 		goto out;
 	}
+
 	size += sizeof(uint32_t);
 	memcpy(tmp_key_attr_buf, &in[size], key_attr_buf_size);
 	size += key_attr_buf_size;
@@ -476,9 +465,11 @@ static TEE_Result TA_deserialize_rsa_keypair(const uint8_t *in,
 		EMSG("Wrong memory buffer length");
 		goto out;
 	}
+
 	size += sizeof(uint32_t);
 	memcpy(tmp_key_attr_buf, &in[size], key_attr_buf_size);
 	size += key_attr_buf_size;
+
 	res = crypto_bignum_bin2bn(tmp_key_attr_buf, key_attr_buf_size,
 				       keyPair->q);
 	if (res != TEE_SUCCESS) {
@@ -547,46 +538,9 @@ out:
 	return res;
 }
 
-static void free_rsa_keypair(struct rsa_keypair *keyPair)
-{
-	//Free keyPair
-	if (keyPair->d) {
-		crypto_bignum_clear(keyPair->d);
-		crypto_bignum_free(keyPair->d);
-	}
-	if (keyPair->dp) {
-		crypto_bignum_clear(keyPair->dp);
-		crypto_bignum_free(keyPair->dp);
-	}
-	if (keyPair->dq) {
-		crypto_bignum_clear(keyPair->dq);
-		crypto_bignum_free(keyPair->dq);
-	}
-	if (keyPair->e) {
-		crypto_bignum_clear(keyPair->e);
-		crypto_bignum_free(keyPair->e);
-	}
-	if (keyPair->n) {
-		crypto_bignum_clear(keyPair->n);
-		crypto_bignum_free(keyPair->n);
-	}
-	if (keyPair->p) {
-		crypto_bignum_clear(keyPair->p);
-		crypto_bignum_free(keyPair->p);
-	}
-	if (keyPair->q) {
-		crypto_bignum_clear(keyPair->q);
-		crypto_bignum_free(keyPair->q);
-	}
-	if (keyPair->qp) {
-		crypto_bignum_clear(keyPair->qp);
-		crypto_bignum_free(keyPair->qp);
-	}
-}
-
-static TEE_Result TA_deserialize_ec_keypair(const uint8_t *in,
-					    uint32_t in_size,
-					    struct ecc_keypair *keyPair)
+static TEE_Result deserialize_ec_keypair(const uint8_t *in,
+				    	 uint32_t in_size,
+				    	 struct ecc_keypair *keyPair)
 {
 	TEE_Result res = TEE_SUCCESS;
 	uint8_t *tmp_key_attr_buf = malloc(EC_KEY_BUFFER_SIZE);
@@ -600,7 +554,7 @@ static TEE_Result TA_deserialize_ec_keypair(const uint8_t *in,
 		goto out;
 	}
 
-	//Public part:
+	/* Public part */
 	memcpy(&key_attr_buf_size, &in[size], sizeof(uint32_t));
 	if (key_attr_buf_size > EC_KEY_BUFFER_SIZE) {
 		res = TEE_ERROR_BAD_PARAMETERS;
@@ -634,6 +588,7 @@ static TEE_Result TA_deserialize_ec_keypair(const uint8_t *in,
 		EMSG("Wrong memory buffer length");
 		goto out;
 	}
+
 	size += sizeof(uint32_t);
 	memcpy(tmp_key_attr_buf, &in[size], key_attr_buf_size);
 	size += key_attr_buf_size;
@@ -644,10 +599,11 @@ static TEE_Result TA_deserialize_ec_keypair(const uint8_t *in,
 		goto out;
 	}
 
-	//Private part:
+	/* Private part */
 	memcpy(&key_attr_buf_size, &in[size], sizeof(uint32_t));
+
 	if (key_attr_buf_size > EC_KEY_BUFFER_SIZE) {
-		res = TEE_ERROR_BAD_PARAMETERS;
+		res = TEE_ERROR_SHORT_BUFFER;
 		EMSG("Wrong memory buffer length");
 		goto out;
 	}
@@ -668,27 +624,10 @@ static TEE_Result TA_deserialize_ec_keypair(const uint8_t *in,
 	}
 
 out:
-	if (tmp_key_attr_buf) {
+	if (tmp_key_attr_buf)
 		free(tmp_key_attr_buf);
-	}
-	return res;
-}
 
-static void free_ecc_keypair(struct ecc_keypair *keyPair)
-{
-	//Free keyPair
-	if (keyPair->d) {
-		crypto_bignum_clear(keyPair->d);
-		crypto_bignum_free(keyPair->d);
-	}
-	if (keyPair->x) {
-		crypto_bignum_clear(keyPair->x);
-		crypto_bignum_free(keyPair->x);
-	}
-	if (keyPair->y) {
-		crypto_bignum_clear(keyPair->y);
-		crypto_bignum_free(keyPair->y);
-	}
+	return res;
 }
 
 static inline keymaster_tag_type_t keymaster_tag_get_type(keymaster_tag_t tag)
@@ -703,14 +642,14 @@ static uint32_t TA_deserialize_blob(uint8_t *in, keymaster_blob_t *blob)
 	memset(blob, 0, sizeof(*blob));
 	memcpy(&blob->data_length, in, sizeof(blob->data_length));
 	size += SIZE_LENGTH;
-	//No memory allocation
+	/* No memory allocation */
 	blob->data = &in[size];
 	size += blob->data_length;
 
 	return size;
 }
 
-static TEE_Result TA_deserialize_characteristics(uint8_t *in, uint32_t in_size,
+static TEE_Result deserialize_characteristics(uint8_t *in, uint32_t in_size,
 			keymaster_key_characteristics_t *characteristics)
 {
 	uint32_t offset = 0;
@@ -724,7 +663,7 @@ static TEE_Result TA_deserialize_characteristics(uint8_t *in, uint32_t in_size,
 
 	if (!characteristics->hw_enforced.params) {
 		EMSG("Failed to allocate memory for hw_enforced.params");
-		return KM_ERROR_MEMORY_ALLOCATION_FAILED;
+		return TEE_ERROR_OUT_OF_MEMORY;
 	}
 
 	characteristics->sw_enforced.length = 0;
@@ -733,7 +672,7 @@ static TEE_Result TA_deserialize_characteristics(uint8_t *in, uint32_t in_size,
 					sizeof(keymaster_key_param_t));
 	if (!characteristics->sw_enforced.params) {
 		EMSG("Failed to allocate memory for sw_enforced.params");
-		return KM_ERROR_MEMORY_ALLOCATION_FAILED;
+		return TEE_ERROR_OUT_OF_MEMORY;
 	}
 
 	memcpy(&characteristics->hw_enforced.length, &in[offset],
@@ -745,11 +684,15 @@ static TEE_Result TA_deserialize_characteristics(uint8_t *in, uint32_t in_size,
 		       SIZE_OF_ITEM(characteristics->hw_enforced.params));
 		offset += SIZE_OF_ITEM(characteristics->hw_enforced.params);
 
-		if (keymaster_tag_get_type(characteristics->
-				hw_enforced.params[i].tag) == KM_BIGNUM ||
-		    keymaster_tag_get_type(characteristics->
-				hw_enforced.params[i].tag) == KM_BYTES) {
-			offset += TA_deserialize_blob(&in[offset], &(characteristics->hw_enforced.params[i].key_param.blob));
+		if (keymaster_tag_get_type(
+			characteristics->hw_enforced.params[i].tag) ==
+		    KM_BIGNUM ||
+		    keymaster_tag_get_type(
+			characteristics->hw_enforced.params[i].tag) ==
+		    KM_BYTES) {
+			offset += TA_deserialize_blob(
+				&in[offset],
+				&(characteristics->hw_enforced.params[i].key_param.blob));
 		}
 	}
 
@@ -778,7 +721,7 @@ static TEE_Result TA_deserialize_characteristics(uint8_t *in, uint32_t in_size,
 	return TEE_SUCCESS;
 }
 
-static TEE_Result TA_deserialize_param_set(uint8_t *in, uint32_t in_size,
+static TEE_Result deserialize_param_set(uint8_t *in, uint32_t in_size,
 					   keymaster_key_param_set_t *params)
 {
 	uint32_t offset = 0;
@@ -792,7 +735,7 @@ static TEE_Result TA_deserialize_param_set(uint8_t *in, uint32_t in_size,
 	params->params = malloc(sizeof(keymaster_key_param_t) * params->length);
 	if (!params->params) {
 		EMSG("Failed to allocate memory for attest params");
-		return KM_ERROR_MEMORY_ALLOCATION_FAILED;
+		return TEE_ERROR_OUT_OF_MEMORY;
 	}
 
 	for (size_t i = 0; i < params->length; i++) {
@@ -825,14 +768,13 @@ static TEE_Result TA_deserialize_param_set(uint8_t *in, uint32_t in_size,
  * params[2].memref.size - parse result size
  * params[3].value.a - key size
  */
-static TEE_Result TA_asn1_decode(uint32_t ptypes,
-				 TEE_Param params[TEE_NUM_PARAMS])
+static TEE_Result asn1_decode(uint32_t ptypes,
+			      TEE_Param params[TEE_NUM_PARAMS])
 {
-	uint32_t exp_param_types = TEE_PARAM_TYPES(
-					TEE_PARAM_TYPE_MEMREF_INPUT,
-					TEE_PARAM_TYPE_VALUE_INPUT,
-					TEE_PARAM_TYPE_MEMREF_OUTPUT,
-					TEE_PARAM_TYPE_VALUE_OUTPUT);
+	uint32_t exp_param_types = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+						   TEE_PARAM_TYPE_VALUE_INPUT,
+						   TEE_PARAM_TYPE_MEMREF_OUTPUT,
+						   TEE_PARAM_TYPE_VALUE_OUTPUT);
 	unsigned long res = CRYPT_OK;
 	ltc_asn1_list *list_root = NULL;
 	struct import_data_t imp_data = {
@@ -852,42 +794,48 @@ static TEE_Result TA_asn1_decode(uint32_t ptypes,
 		EMSG("Wrong parameters\n");
 		return TEE_ERROR_BAD_PARAMETERS;
 	}
+
 	*output_size = 0;
 	*key_size = 0;
+
 	res = der_decode_sequence_flexi(data, &size, &list_root);
 	if (res != CRYPT_OK) {
 		EMSG("Failed to decode asn1 list");
 		goto out;
 	}
-	res = TA_iterate_asn1_list(list_root, 0, &imp_data);
+
+	res = iterate_asn1_list(list_root, 0, &imp_data);
 	if (res != CRYPT_OK) {
 		EMSG("Root iteration failed");
 		goto out;
 	}
-	res = TA_check_object_identifier(&imp_data, algorithm, key_size);
+
+	res = check_object_identifier(&imp_data, algorithm, key_size);
 	if (res != CRYPT_OK)
 		goto out;
 	if (imp_data.octet_str_data == NULL ||
 				imp_data.octet_str_length == 0) {
 		EMSG("Octet string is empty");
-		res = KM_ERROR_UNSUPPORTED_KEY_ENCRYPTION_ALGORITHM;
+		res = TEE_ERROR_NOT_SUPPORTED;
 		goto out;
 	}
+
 	der_sequence_free(list_root);
 	res = der_decode_sequence_flexi(imp_data.octet_str_data,
 				&imp_data.octet_str_length, &list_root);
 	if (res != CRYPT_OK) {
 		EMSG("Failed to decode attributes with code %lx", res);
-		res = KM_ERROR_UNSUPPORTED_KEY_ENCRYPTION_ALGORITHM;
+		res = TEE_ERROR_NOT_SUPPORTED;
 		goto out;
 	}
-	res = TA_iterate_asn1_attrs(list_root, 0,
-				&attrs_count, algorithm,
-				output, output_size, key_size);
+	res = iterate_asn1_attrs(list_root, 0,
+				 &attrs_count, algorithm,
+				 output, output_size, key_size);
 out:
 	der_sequence_free(list_root);
 	if (imp_data.octet_str_data)
 		free(imp_data.octet_str_data);
+
 	return res;
 }
 
@@ -900,7 +848,7 @@ static int wrap(uint8_t *out, uint64_t *out_l, const uint8_t *in,
 	uint64_t remainder = in_l;
 
 	if (*out_l < in_l + MAX_HEADER_SIZE) {
-		res = KM_ERROR_UNKNOWN_ERROR;
+		res = TEE_ERROR_SHORT_BUFFER;
 		EMSG("Output buffer is to small to do wrap");
 		goto out;
 	}
@@ -980,7 +928,7 @@ static int encode_params(uint8_t **params_buf, uint64_t *params_buf_l,
 					BYTES_PER_WORD + attr1_l);
 		if (!num_attr1) {
 			EMSG("Failed to allocate memory for number of attr 1");
-			res = KM_ERROR_MEMORY_ALLOCATION_FAILED;
+			res = TEE_ERROR_OUT_OF_MEMORY;
 			goto out;
 		}
 		num_attr1->alloc = sizeof(struct bignum) +
@@ -997,7 +945,7 @@ static int encode_params(uint8_t **params_buf, uint64_t *params_buf_l,
 		out_buf = malloc(out_buf_l);
 		if (!out_buf) {
 			EMSG("Failed to allocate memory for params buffer");
-			res = KM_ERROR_MEMORY_ALLOCATION_FAILED;
+			res = TEE_ERROR_OUT_OF_MEMORY;
 			goto out;
 		}
 		res = der_encode_sequence_multi(out_buf, &out_buf_l,
@@ -1016,7 +964,7 @@ static int encode_params(uint8_t **params_buf, uint64_t *params_buf_l,
 		out_buf = malloc(out_buf_l);
 		if (!out_buf) {
 			EMSG("Failed to allocate memory for params buffer");
-			res = KM_ERROR_MEMORY_ALLOCATION_FAILED;
+			res = TEE_ERROR_OUT_OF_MEMORY;
 			goto out;
 		}
 		memset(out_buf, 0, out_buf_l);
@@ -1038,7 +986,7 @@ static int encode_params(uint8_t **params_buf, uint64_t *params_buf_l,
 	*params_buf = malloc(*params_buf_l);
 	if (!(*params_buf)) {
 		EMSG("Failed to allocate memory for key params");
-		res = KM_ERROR_MEMORY_ALLOCATION_FAILED;
+		res = TEE_ERROR_OUT_OF_MEMORY;
 		goto out;
 	}
 	res = der_encode_raw_bit_string(out_buf, out_buf_l * 8,
@@ -1068,7 +1016,7 @@ out:
  * params[3].memref.buffer - ASN.1 DER-encoded public key
  * params[3].memref.size - ASN.1 DER-encoded public key size
  */
-static TEE_Result TA_asn1_encode_pubkey(uint32_t ptypes,
+static TEE_Result asn1_encode_pubkey(uint32_t ptypes,
 					TEE_Param params[TEE_NUM_PARAMS])
 {
 	uint32_t exp_param_types = TEE_PARAM_TYPES(
@@ -1131,13 +1079,13 @@ static TEE_Result TA_asn1_encode_pubkey(uint32_t ptypes,
 		default:
 			EMSG("Fialed to determine OID for EC key with size %u",
 								key_size);
-			res = KM_ERROR_UNIMPLEMENTED;
+			res = TEE_ERROR_NOT_IMPLEMENTED;
 			goto out;
 		}
 	}
 	oid_buf = malloc(oid_buf_l);
 	if (!oid_buf) {
-		res = KM_ERROR_MEMORY_ALLOCATION_FAILED;
+		res = TEE_ERROR_OUT_OF_MEMORY;
 		EMSG("Failed to allocate memory for OID buffer");
 		goto out;
 	}
@@ -1157,7 +1105,7 @@ static TEE_Result TA_asn1_encode_pubkey(uint32_t ptypes,
 	out_buf_l = params_buf_l + oid_buf_l;
 	out_buf = malloc(out_buf_l);
 	if (!out_buf) {
-		res = KM_ERROR_MEMORY_ALLOCATION_FAILED;
+		res = TEE_ERROR_OUT_OF_MEMORY;
 		EMSG("Failed to allocate memory for ASN.1 key buffer");
 		goto out;
 	}
@@ -1190,7 +1138,7 @@ out:
  * params[2].memref.buffer - encoded sign data
  * params[2].memref.size - encoded sign data length
  */
-static TEE_Result TA_ec_sign_encode(uint32_t ptypes,
+static TEE_Result ec_sign_encode(uint32_t ptypes,
 				    TEE_Param params[TEE_NUM_PARAMS])
 {
 	uint32_t exp_param_types = TEE_PARAM_TYPES(
@@ -1214,13 +1162,13 @@ static TEE_Result TA_ec_sign_encode(uint32_t ptypes,
 	s = malloc(sizeof(struct bignum) + BYTES_PER_WORD + s_size);
 	if (!s) {
 		EMSG("Failed to allocate memory for EC sign number S");
-		res = KM_ERROR_MEMORY_ALLOCATION_FAILED;
+		res = TEE_ERROR_OUT_OF_MEMORY;
 		goto out;
 	}
 	r = malloc(sizeof(struct bignum) + BYTES_PER_WORD + r_size);
 	if (!r) {
 		EMSG("Failed to allocate memory for EC sign number R");
-		res = KM_ERROR_MEMORY_ALLOCATION_FAILED;
+		res = TEE_ERROR_OUT_OF_MEMORY;
 		goto out;
 	}
 	s->alloc = sizeof(struct bignum) + BYTES_PER_WORD + s_size;
@@ -1240,7 +1188,7 @@ static TEE_Result TA_ec_sign_encode(uint32_t ptypes,
 	out_buf = malloc(out_buf_l);
 	if (!out_buf) {
 		EMSG("Failed to allocate memory for EC sign buffer");
-		res = KM_ERROR_MEMORY_ALLOCATION_FAILED;
+		res = TEE_ERROR_OUT_OF_MEMORY;
 		goto out;
 	}
 	res = der_encode_sequence_multi(out_buf, &out_buf_l,
@@ -1273,7 +1221,7 @@ out:
  * params[2].memref.buffer - decoded sign data
  * params[2].memref.size - decoded sign data length
  */
-static TEE_Result TA_ec_sign_decode(uint32_t ptypes,
+static TEE_Result ec_sign_decode(uint32_t ptypes,
 				    TEE_Param params[TEE_NUM_PARAMS])
 {
 	uint32_t exp_param_types = TEE_PARAM_TYPES(
@@ -1300,13 +1248,13 @@ static TEE_Result TA_ec_sign_decode(uint32_t ptypes,
 	s = malloc(sizeof(struct bignum) + BYTES_PER_WORD + input_l / 2);
 	if (!s) {
 		EMSG("Failed to allocate memory for EC sign number S");
-		res = KM_ERROR_MEMORY_ALLOCATION_FAILED;
+		res = TEE_ERROR_OUT_OF_MEMORY;
 		goto out;
 	}
 	r = malloc(sizeof(struct bignum) + BYTES_PER_WORD + input_l / 2);
 	if (!r) {
 		EMSG("Failed to allocate memory for EC sign number R");
-		res = KM_ERROR_MEMORY_ALLOCATION_FAILED;
+		res = TEE_ERROR_OUT_OF_MEMORY;
 		goto out;
 	}
 	s->alloc = sizeof(struct bignum) + BYTES_PER_WORD + input_l / 2;
@@ -1346,7 +1294,7 @@ out:
  * params[1].memref.buffer - ASN.1 DER-encoded certificate
  * params[1].memref.size - ASN.1 DER-encoded certificate length
  */
-static TEE_Result TA_gen_root_rsa_cert(uint32_t ptypes,
+static TEE_Result gen_root_rsa_cert(uint32_t ptypes,
 				       TEE_Param params[TEE_NUM_PARAMS])
 {
 	uint32_t exp_param_types = TEE_PARAM_TYPES(
@@ -1371,13 +1319,13 @@ static TEE_Result TA_gen_root_rsa_cert(uint32_t ptypes,
 	uint8_t *signature = NULL;
 	size_t signature_size = RSA_SIGN_BUFFER_SIZE;
 
-	//Certificate data
+	/* Certificate data */
 	ltc_asn1_list Certificate[CERT_SIZE];
 	der_TBS *tbsCertificate = NULL;
 	der_algId algId;
 	unsigned char *pk;
 	ULONG pk_size = 0;
-	//End certificate data
+	/* End certificate data */
 
 	if (!key_attr || !output_certificate) {
 		res = TEE_ERROR_BAD_PARAMETERS;
@@ -1401,14 +1349,14 @@ static TEE_Result TA_gen_root_rsa_cert(uint32_t ptypes,
 		goto out;
 	}
 
-	res = crypto_acipher_alloc_rsa_keypair(keyPair, RSA_KEY_SIZE);
+	res = crypto_acipher_alloc_rsa_keypair(keyPair, MAX_RSA_SIZE);
 	if (res != TEE_SUCCESS) {
 		EMSG("Failed to allocate RSA keypair, res=%x", res);
 		goto out;
 	}
 
-	//Root RSA attestation key
-	res = TA_deserialize_rsa_keypair(key_attr, key_attr_size, keyPair);
+	/* Root RSA attestation key */
+	res = deserialize_rsa_keypair(key_attr, key_attr_size, keyPair);
 	if (res != TEE_SUCCESS) {
 		EMSG("Failed to deserialize RSA keypair, res=%x", res);
 		goto out;
@@ -1419,7 +1367,7 @@ static TEE_Result TA_gen_root_rsa_cert(uint32_t ptypes,
 		EMSG("Failed to malloc TBS field for RSA x509 certificate");
 		goto out;
 	}
-	//Encode tbsCertificate
+	/* Encode tbsCertificate */
 	output_certificate_size = ROOT_CERT_BUFFER_SIZE;
 	res = rootTBSencodeRSA_BN(tbsCertificate, &algId, (void *)keyPair->n,
 				  (void *)keyPair->e, output_certificate,
@@ -1428,12 +1376,12 @@ static TEE_Result TA_gen_root_rsa_cert(uint32_t ptypes,
 		EMSG("Failed to encode TBS DER certificate, res=%x", res);
 		if (res == CRYPT_BUFFER_OVERFLOW) {
 			EMSG("Error: to long encoded TBS DER certificate");
-			res = KM_ERROR_INSUFFICIENT_BUFFER_SPACE;
+			res = TEE_ERROR_SHORT_BUFFER;
 		}
 		goto out;
 	}
 
-	//Hash tbsCertificate
+	/* Hash tbsCertificate */
 	res = crypto_hash_alloc_ctx(&hashCtx, hashAlgo);
 	if (res != TEE_SUCCESS || !hashCtx) {
 		res = TEE_ERROR_OUT_OF_MEMORY;
@@ -1466,7 +1414,8 @@ static TEE_Result TA_gen_root_rsa_cert(uint32_t ptypes,
 		EMSG("Failed to malloc RSA signature");
 		goto out;
 	}
-	//Signature computed on ASN.1 DER-encoded tbsCertificate
+
+	/* Signature computed on ASN.1 DER-encoded tbsCertificate */
 	res = crypto_acipher_rsassa_sign(TEE_ALG_RSASSA_PKCS1_V1_5_SHA256,
 					     keyPair, 0, hash_sha256,
 					     SHA256_BUFFER_SIZE,
@@ -1476,13 +1425,13 @@ static TEE_Result TA_gen_root_rsa_cert(uint32_t ptypes,
 		goto out;
 	}
 
-	//Encode certificate
+	/* Encode certificate */
 	LTC_SET_ASN1(Certificate, 0, X509_TBS, tbsCertificate->tbs, TBS_SIZE);
 	LTC_SET_ASN1(Certificate, 1, X509_ALGID, algId, ALG_ID_SIZE);
 	LTC_SET_ASN1(Certificate, 2, X509_SIGN_VAL, signature,
 		     8 * signature_size);
 
-	//Encode output DER certificate
+	/* Encode output DER certificate */
 	output_certificate_size = ROOT_CERT_BUFFER_SIZE;
 	res = der_encode_sequence(Certificate, CERT_SIZE, output_certificate,
 				  &output_certificate_size);
@@ -1491,27 +1440,29 @@ static TEE_Result TA_gen_root_rsa_cert(uint32_t ptypes,
 		EMSG("Failed to encode DER certificate, res=%x", res);
 		if (res == CRYPT_BUFFER_OVERFLOW) {
 			EMSG("Error: to long encoded DER certificate");
-			res = KM_ERROR_INSUFFICIENT_BUFFER_SPACE;
+			res = TEE_ERROR_SHORT_BUFFER;
 		}
 		goto out;
 	}
 
-	//Copy ASN.1 DERencoded certificate length
+	/* copy ASN.1 DERencoded certificate length */
 	params[1].memref.size = output_certificate_size;
 
 out:
-	if (pk) {
+	if (pk)
 		free(pk);
-	}
+
 	if (keyPair) {
-		free_rsa_keypair(keyPair);
+		crypto_acipher_free_rsa_keypair(keyPair);
 		free(keyPair);
 	}
-	if (hashCtx) {
+
+	if (hashCtx)
 		free(hashCtx);
-	}
+
 	if (tbsCertificate)
 		free(tbsCertificate);
+
 	if (signature)
 		free(signature);
 
@@ -1527,7 +1478,7 @@ out:
  * params[1].memref.buffer - ASN.1 DER-encoded certificate
  * params[1].memref.size - ASN.1 DER-encoded certificate length
  */
-static TEE_Result TA_gen_root_ec_cert(uint32_t ptypes,
+static TEE_Result gen_root_ec_cert(uint32_t ptypes,
 				      TEE_Param params[TEE_NUM_PARAMS])
 {
 	uint32_t exp_param_types = TEE_PARAM_TYPES(
@@ -1552,13 +1503,13 @@ static TEE_Result TA_gen_root_ec_cert(uint32_t ptypes,
 	uint8_t *signature = NULL;
 	size_t signature_size = EC_SIGN_BUFFER_SIZE;
 
-	//Certificate data
+	/* Certificate data */
 	ltc_asn1_list Certificate[CERT_SIZE];
 	der_TBS *tbsCertificate = NULL;
 	der_algId algId;
 	unsigned char *pk;
 	ULONG pk_size = 0;
-	//End certificate data
+	/* End certificate data */
 
 	if (!key_attr || !output_certificate) {
 		res = TEE_ERROR_BAD_PARAMETERS;
@@ -1582,8 +1533,8 @@ static TEE_Result TA_gen_root_ec_cert(uint32_t ptypes,
 		goto out;
 	}
 
-	//Root EC attestation key
-	res = TA_deserialize_ec_keypair(key_attr, key_attr_size, &keyPair);
+	/* Root EC attestation key */
+	res = deserialize_ec_keypair(key_attr, key_attr_size, &keyPair);
 	if (res != TEE_SUCCESS) {
 		EMSG("Failed to deserialize EC keypair, res=%x", res);
 		goto out;
@@ -1594,7 +1545,7 @@ static TEE_Result TA_gen_root_ec_cert(uint32_t ptypes,
 		EMSG("Failed to malloc TBS field for EC x509 certificate");
 		goto out;
 	}
-	//Encode tbsCertificate
+	/* Encode tbsCertificate */
 	output_certificate_size = ROOT_CERT_BUFFER_SIZE;
 	res = rootTBSencodeECC_BN(tbsCertificate, &algId, (void *)keyPair.x,
 				  (void *)keyPair.y, output_certificate,
@@ -1604,12 +1555,12 @@ static TEE_Result TA_gen_root_ec_cert(uint32_t ptypes,
 		EMSG("Failed to encode TBS DER certificate, res=%x", res);
 		if (res == CRYPT_BUFFER_OVERFLOW) {
 			EMSG("Error: to long encoded TBS DER certificate");
-			res = KM_ERROR_INSUFFICIENT_BUFFER_SPACE;
+			res = TEE_ERROR_SHORT_BUFFER;
 		}
 		goto out;
 	}
 
-	//Hash tbsCertificate
+	/* Hash tbsCertificate */
 	res = crypto_hash_alloc_ctx(&hashCtx, hashAlgo);
 	if (res != TEE_SUCCESS || !hashCtx) {
 		res = TEE_ERROR_OUT_OF_MEMORY;
@@ -1642,7 +1593,7 @@ static TEE_Result TA_gen_root_ec_cert(uint32_t ptypes,
 		EMSG("Failed to malloc EC signature");
 		goto out;
 	}
-	//Sign certificate
+	/* Sign certificate */
 	res = crypto_acipher_ecc_sign(TEE_ALG_ECDSA_P256, &keyPair,
 					  hash_sha256, SHA256_BUFFER_SIZE,
 					  signature, &signature_size);
@@ -1655,13 +1606,13 @@ static TEE_Result TA_gen_root_ec_cert(uint32_t ptypes,
 	if (res != CRYPT_OK)
 		goto out;
 
-	//Encode certificate
+	/* Encode certificate */
 	LTC_SET_ASN1(Certificate, 0, X509_TBS, tbsCertificate->tbs, TBS_SIZE);
 	LTC_SET_ASN1(Certificate, 1, X509_ALGID, algId, ALG_ID_SIZE);
 	LTC_SET_ASN1(Certificate, 2, X509_SIGN_VAL, signature,
 		     8 * signature_size);
 
-	//Encode output DER certificate
+	/* Encode output DER certificate */
 	output_certificate_size = ROOT_CERT_BUFFER_SIZE;
 	res = der_encode_sequence(Certificate, CERT_SIZE, output_certificate,
 				  &output_certificate_size);
@@ -1670,27 +1621,28 @@ static TEE_Result TA_gen_root_ec_cert(uint32_t ptypes,
 		EMSG("Failed to encode DER certificate, res=%x", res);
 		if (res == CRYPT_BUFFER_OVERFLOW) {
 			EMSG("Error: to long encoded DER certificate");
-			res = KM_ERROR_INSUFFICIENT_BUFFER_SPACE;
+			res = TEE_ERROR_SHORT_BUFFER;
 		}
 		goto out;
 	}
 
-	//Copy ASN.1 DERencoded certificate length
+	/* Copy ASN.1 DERencoded certificate length */
 	params[1].memref.size = output_certificate_size;
 
 out:
-	if (pk) {
+	if (pk)
 		free(pk);
-	}
-	free_ecc_keypair(&keyPair);
-	if (hashCtx) {
+
+	crypto_acipher_free_ecc_keypair(&keyPair);
+
+	if (hashCtx)
 		free(hashCtx);
-	}
+
 	if (tbsCertificate)
 		free(tbsCertificate);
+
 	if (signature)
 		free(signature);
-
 
 	return res;
 }
@@ -1708,8 +1660,9 @@ out:
  * params[3].memref.buffer - ASN.1 DER-encoded certificate
  * params[3].memref.size - ASN.1 DER-encoded certificate length
  */
-static TEE_Result TA_gen_attest_rsa_cert(uint32_t ptypes  __unused,
-					 TEE_Param params[TEE_NUM_PARAMS]  __unused)
+static TEE_Result gen_attest_rsa_cert(uint32_t ptypes  __unused,
+				      TEE_Param params[TEE_NUM_PARAMS]
+				      __unused)
 {
 	uint32_t exp_param_types = TEE_PARAM_TYPES(
 					TEE_PARAM_TYPE_MEMREF_INPUT,
@@ -1741,14 +1694,14 @@ static TEE_Result TA_gen_attest_rsa_cert(uint32_t ptypes  __unused,
 	uint8_t *signature = NULL;
 	size_t signature_size = RSA_SIGN_BUFFER_SIZE;
 
-	//Certificate data
+	/* Certificate data */
 	ltc_asn1_list Certificate[CERT_SIZE];
 	der_TBS_ATTEST *tbsCertificate = NULL;
 	der_algId algId;
 	unsigned char *pk;
 	ULONG pk_size = 0;
 	unsigned char *attestExt;
-	//End certificate data
+	/* End certificate data */
 
 	if (!params[0].memref.buffer || !key_charact || !root_key_attr ||
 	    !output_certificate) {
@@ -1774,15 +1727,15 @@ static TEE_Result TA_gen_attest_rsa_cert(uint32_t ptypes  __unused,
 		goto out;
 	}
 
-	res = crypto_acipher_alloc_rsa_keypair(keyPair, RSA_KEY_SIZE);
+	res = crypto_acipher_alloc_rsa_keypair(keyPair, MAX_RSA_SIZE);
 	if (res != TEE_SUCCESS) {
 		EMSG("Failed to allocate RSA keypair, res=%x", res);
 		goto out;
 	}
 
-	//Key characteristics
+	/* Key characteristics */
 	memcpy(&key_charact_size, &key_charact[0], sizeof(uint32_t));
-	res = TA_deserialize_characteristics(&key_charact[sizeof(uint32_t)],
+	res = deserialize_characteristics(&key_charact[sizeof(uint32_t)],
 					     key_charact_size,
 					     &characteristics);
 	if (res != TEE_SUCCESS) {
@@ -1790,14 +1743,14 @@ static TEE_Result TA_gen_attest_rsa_cert(uint32_t ptypes  __unused,
 		     res);
 		goto out;
 	}
-	//Attestation parameters
+
+	/* Attestation parameters */
 	memcpy(&att_params_size,
 	       &key_charact[sizeof(uint32_t) + key_charact_size],
 	       sizeof(uint32_t));
-	res = TA_deserialize_param_set(&key_charact[sizeof(uint32_t) * 2 +
-						    key_charact_size],
-				       att_params_size,
-				       &attest_params);
+	res = deserialize_param_set(&key_charact[sizeof(uint32_t) * 2 +
+						 key_charact_size],
+				    att_params_size, &attest_params);
 	if (res != TEE_SUCCESS) {
 		EMSG("Failed to deserialize RSA attestation parameters, res=%x",
 		     res);
@@ -1807,8 +1760,8 @@ static TEE_Result TA_gen_attest_rsa_cert(uint32_t ptypes  __unused,
 	verified_boot_state = key_charact[sizeof(uint32_t) * 2 +
 	                                  key_charact_size + att_params_size];
 
-	//Root RSA attestation key
-	res = TA_deserialize_rsa_keypair(root_key_attr, root_key_attr_size,
+	/* Root RSA attestation key */
+	res = deserialize_rsa_keypair(root_key_attr, root_key_attr_size,
 					 keyPair);
 	if (res != TEE_SUCCESS) {
 		EMSG("Failed to deserialize RSA keypair, res=%x", res);
@@ -1820,6 +1773,7 @@ static TEE_Result TA_gen_attest_rsa_cert(uint32_t ptypes  __unused,
 		EMSG("Failed to malloc TBS field for RSA attestation");
 		goto out;
 	}
+
 	/* Encode key params */
 	res = encodeKeyDescription(tbsCertificate->extVals, &attestExt,
 				   &attest_params, &characteristics,
@@ -1838,12 +1792,12 @@ static TEE_Result TA_gen_attest_rsa_cert(uint32_t ptypes  __unused,
 		EMSG("Failed to encode TBS DER certificate, res=%x", res);
 		if (res == CRYPT_BUFFER_OVERFLOW) {
 			EMSG("Error: to long encoded TBS DER certificate");
-			res = KM_ERROR_INSUFFICIENT_BUFFER_SPACE;
+			res = TEE_ERROR_SHORT_BUFFER;
 		}
 		goto out;
 	}
 
-	//Hash tbsCertificate
+	/* Hash tbsCertificate */
 	res = crypto_hash_alloc_ctx(&hashCtx, hashAlgo);
 	if (res != TEE_SUCCESS || !hashCtx) {
 		res = TEE_ERROR_OUT_OF_MEMORY;
@@ -1876,7 +1830,8 @@ static TEE_Result TA_gen_attest_rsa_cert(uint32_t ptypes  __unused,
 		EMSG("Failed to malloc RSA signature");
 		goto out;
 	}
-	//Sign certificate
+
+	/* Sign certificate */
 	res = crypto_acipher_rsassa_sign(TEE_ALG_RSASSA_PKCS1_V1_5_SHA256,
 					     keyPair, 0, hash_sha256,
 					     SHA256_BUFFER_SIZE, signature,
@@ -1886,13 +1841,13 @@ static TEE_Result TA_gen_attest_rsa_cert(uint32_t ptypes  __unused,
 		goto out;
 	}
 
-	//Encode certificate
+	/* Encode certificate */
 	LTC_SET_ASN1(Certificate, 0, X509_TBS, tbsCertificate->tbs, TBS_SIZE);
 	LTC_SET_ASN1(Certificate, 1, X509_ALGID, algId, ALG_ID_SIZE);
 	LTC_SET_ASN1(Certificate, 2, X509_SIGN_VAL, signature,
 		     8 * signature_size);
 
-	//Encode output DER certificate
+	/* Encode output DER certificate */
 	output_certificate_size = ROOT_CERT_BUFFER_SIZE;
 	res = der_encode_sequence(Certificate, CERT_SIZE, output_certificate,
 				  &output_certificate_size);
@@ -1901,12 +1856,12 @@ static TEE_Result TA_gen_attest_rsa_cert(uint32_t ptypes  __unused,
 		EMSG("Failed to encode DER certificate, res=%x", res);
 		if (res == CRYPT_BUFFER_OVERFLOW) {
 			EMSG("Error: to long encoded DER certificate");
-			res = KM_ERROR_INSUFFICIENT_BUFFER_SPACE;
+			res = TEE_ERROR_SHORT_BUFFER;
 		}
 		goto out;
 	}
 
-	//Copy ASN.1 DERencoded certificate length
+	/* Copy ASN.1 DERencoded certificate length */
 	params[3].memref.size = output_certificate_size;
 out:
 	if (pk)
@@ -1914,8 +1869,9 @@ out:
 
 	if (attestExt)
 		free(attestExt);
+
 	if (keyPair) {
-		free_rsa_keypair(keyPair);
+		crypto_acipher_free_rsa_keypair(keyPair);
 		free(keyPair);
 	}
 	if (hashCtx)
@@ -1929,8 +1885,10 @@ out:
 
 	if (attest_params.params)
 		free(attest_params.params);
+
 	if (tbsCertificate)
 		free(tbsCertificate);
+
 	if (signature)
 		free(signature);
 
@@ -1950,14 +1908,14 @@ out:
  * params[3].memref.buffer - ASN.1 DER-encoded certificate
  * params[3].memref.size - ASN.1 DER-encoded certificate length
  */
-static TEE_Result TA_gen_attest_ec_cert(uint32_t ptypes  __unused,
-					TEE_Param params[TEE_NUM_PARAMS]  __unused)
+static TEE_Result gen_attest_ec_cert(uint32_t ptypes  __unused,
+				     TEE_Param params[TEE_NUM_PARAMS] __unused)
 {
-	uint32_t exp_param_types = TEE_PARAM_TYPES(
-					TEE_PARAM_TYPE_MEMREF_INPUT,
-					TEE_PARAM_TYPE_MEMREF_INPUT,
-					TEE_PARAM_TYPE_MEMREF_INPUT,
-					TEE_PARAM_TYPE_MEMREF_OUTPUT);
+	uint32_t exp_param_types = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+						   TEE_PARAM_TYPE_MEMREF_INPUT,
+						   TEE_PARAM_TYPE_MEMREF_INPUT,
+						   TEE_PARAM_TYPE_MEMREF_OUTPUT
+	);
 
 	TEE_Result res = TEE_SUCCESS;
 
@@ -1983,14 +1941,14 @@ static TEE_Result TA_gen_attest_ec_cert(uint32_t ptypes  __unused,
 	uint8_t *signature = NULL;
 	size_t signature_size = EC_SIGN_BUFFER_SIZE;
 
-	//Certificate data
+	/* Certificate data */
 	ltc_asn1_list Certificate[CERT_SIZE];
 	der_TBS_ATTEST *tbsCertificate = NULL;
 	der_algId algId;
 	unsigned char *pk;
 	ULONG pk_size = 0;
 	unsigned char *attestExt;
-	//End certificate data
+	/* End certificate data */
 
 	if (!params[0].memref.buffer || !key_charact || !root_key_attr ||
 	    !output_certificate) {
@@ -2018,9 +1976,9 @@ static TEE_Result TA_gen_attest_ec_cert(uint32_t ptypes  __unused,
 		goto out;
 	}
 
-	//Key characteristics
+	/* Key characteristics */
 	memcpy(&key_charact_size, &key_charact[0], sizeof(uint32_t));
-	res = TA_deserialize_characteristics(&key_charact[sizeof(uint32_t)],
+	res = deserialize_characteristics(&key_charact[sizeof(uint32_t)],
 					     key_charact_size,
 					     &characteristics);
 	if (res != TEE_SUCCESS) {
@@ -2028,11 +1986,11 @@ static TEE_Result TA_gen_attest_ec_cert(uint32_t ptypes  __unused,
 		     res);
 		goto out;
 	}
-	//Attestation parameters
+	/* Attestation parameters */
 	memcpy(&att_params_size,
 	       &key_charact[sizeof(uint32_t) + key_charact_size],
 	       sizeof(uint32_t));
-	res = TA_deserialize_param_set(&key_charact[sizeof(uint32_t) * 2 +
+	res = deserialize_param_set(&key_charact[sizeof(uint32_t) * 2 +
 						    key_charact_size],
 				       att_params_size,
 				       &attest_params);
@@ -2045,8 +2003,8 @@ static TEE_Result TA_gen_attest_ec_cert(uint32_t ptypes  __unused,
 	verified_boot_state = key_charact[sizeof(uint32_t) * 2 +
 	                                  key_charact_size + att_params_size];
 
-	//Root EC attestation key
-	res = TA_deserialize_ec_keypair(root_key_attr, root_key_attr_size,
+	/* Root EC attestation key */
+	res = deserialize_ec_keypair(root_key_attr, root_key_attr_size,
 					&keyPair);
 	if (res != TEE_SUCCESS) {
 		EMSG("Failed to deserialize EC keypair, res=%x", res);
@@ -2067,7 +2025,7 @@ static TEE_Result TA_gen_attest_ec_cert(uint32_t ptypes  __unused,
 		goto out;
 	}
 
-	//Encode tbsCertificate
+	/* Encode tbsCertificate */
 	output_certificate_size = ROOT_CERT_BUFFER_SIZE;
 	res = attestTBSencodeECC(tbsCertificate, &algId,
 				 params[0].memref.buffer, output_certificate,
@@ -2076,12 +2034,12 @@ static TEE_Result TA_gen_attest_ec_cert(uint32_t ptypes  __unused,
 		EMSG("Failed to encode TBS DER certificate, res=%x", res);
 		if (res == CRYPT_BUFFER_OVERFLOW) {
 			EMSG("Error: to long encoded TBS DER certificate");
-			res = KM_ERROR_INSUFFICIENT_BUFFER_SPACE;
+			res = TEE_ERROR_SHORT_BUFFER;
 		}
 		goto out;
 	}
 
-	//Hash tbsCertificate
+	/* Hash tbsCertificate */
 	res = crypto_hash_alloc_ctx(&hashCtx, hashAlgo);
 	if (res != TEE_SUCCESS || !hashCtx) {
 		res = TEE_ERROR_OUT_OF_MEMORY;
@@ -2114,7 +2072,7 @@ static TEE_Result TA_gen_attest_ec_cert(uint32_t ptypes  __unused,
 		EMSG("Failed to malloc EC signature");
 		goto out;
 	}
-	//Sign certificate
+	/* Sign certificate */
 	res = crypto_acipher_ecc_sign(TEE_ALG_ECDSA_P256, &keyPair,
 					  hash_sha256, SHA256_BUFFER_SIZE,
 					  signature, &signature_size);
@@ -2127,13 +2085,13 @@ static TEE_Result TA_gen_attest_ec_cert(uint32_t ptypes  __unused,
 	if (res != CRYPT_OK)
 		goto out;
 
-	//Encode certificate
+	/* Encode certificate */
 	LTC_SET_ASN1(Certificate, 0, X509_TBS, tbsCertificate->tbs, TBS_SIZE);
 	LTC_SET_ASN1(Certificate, 1, X509_ALGID, algId, ALG_ID_SIZE);
 	LTC_SET_ASN1(Certificate, 2, X509_SIGN_VAL, signature,
 		     8 * signature_size);
 
-	//Encode output DER certificate
+	/* Encode output DER certificate */
 	output_certificate_size = ROOT_CERT_BUFFER_SIZE;
 	res = der_encode_sequence(Certificate, CERT_SIZE, output_certificate,
 				  &output_certificate_size);
@@ -2142,12 +2100,12 @@ static TEE_Result TA_gen_attest_ec_cert(uint32_t ptypes  __unused,
 		EMSG("Failed to encode DER certificate, res=%x", res);
 		if (res == CRYPT_BUFFER_OVERFLOW) {
 			EMSG("Error: to long encoded DER certificate");
-			res = KM_ERROR_INSUFFICIENT_BUFFER_SPACE;
+			res = TEE_ERROR_SHORT_BUFFER;
 		}
 		goto out;
 	}
 
-	//Copy ASN.1 DERencoded certificate length
+	/* Copy ASN.1 DERencoded certificate length */
 	params[3].memref.size = output_certificate_size;
 
 out:
@@ -2157,7 +2115,8 @@ out:
 	if (attestExt)
 		free(attestExt);
 
-	free_ecc_keypair(&keyPair);
+	crypto_acipher_free_ecc_keypair(&keyPair);
+
 	if (hashCtx)
 		free(hashCtx);
 
@@ -2169,8 +2128,10 @@ out:
 
 	if (attest_params.params)
 		free(attest_params.params);
+
 	if (tbsCertificate)
 		free(tbsCertificate);
+
 	if (signature)
 		free(signature);
 
@@ -2182,31 +2143,30 @@ static TEE_Result invoke_command(void *psess __unused,
 				 TEE_Param params[TEE_NUM_PARAMS])
 {
 	switch (cmd) {
-	//Generic commands
-	case CMD_ASN1_DECODE:
-		return TA_asn1_decode(ptypes, params);
-	case CMD_ASN1_ENCODE_PUBKEY:
-		return TA_asn1_encode_pubkey(ptypes, params);
-	case CMD_EC_SIGN_ENCODE:
-		return TA_ec_sign_encode(ptypes, params);
-	case CMD_EC_SIGN_DECODE:
-		return TA_ec_sign_decode(ptypes, params);
-	//Attestation commands
-	case CMD_ASN1_GEN_ROOT_RSA_CERT:
-		return TA_gen_root_rsa_cert(ptypes, params);
-	case CMD_ASN1_GEN_ROOT_EC_CERT:
-		return TA_gen_root_ec_cert(ptypes, params);
-	case CMD_ASN1_GEN_ATT_RSA_CERT:
-		return TA_gen_attest_rsa_cert(ptypes, params);
-	case CMD_ASN1_GEN_ATT_EC_CERT:
-		return TA_gen_attest_ec_cert(ptypes, params);
+	case ASN1_PARSER_CMD_DECODE:
+		return asn1_decode(ptypes, params);
+	case ASN1_PARSER_CMD_ENCODE_PUBKEY:
+		return asn1_encode_pubkey(ptypes, params);
+	case ASN1_PARSER_CMD_EC_SIGN_ENCODE:
+		return ec_sign_encode(ptypes, params);
+	case ASN1_PARSER_CMD_EC_SIGN_DECODE:
+		return ec_sign_decode(ptypes, params);
+	case ASN1_PARSER_CMD_GEN_ROOT_RSA_CERT:
+		return gen_root_rsa_cert(ptypes, params);
+	case ASN1_PARSER_CMD_GEN_ROOT_EC_CERT:
+		return gen_root_ec_cert(ptypes, params);
+	case ASN1_PARSER_CMD_GEN_ATT_RSA_CERT:
+		return gen_attest_rsa_cert(ptypes, params);
+	case ASN1_PARSER_CMD_GEN_ATT_EC_CERT:
+		return gen_attest_ec_cert(ptypes, params);
 
 	default:
 		break;
 	}
+
 	return TEE_ERROR_BAD_PARAMETERS;
 }
 
 pseudo_ta_register(.uuid = ASN1_PARSER_UUID, .name = TA_NAME,
-		.flags = PTA_DEFAULT_FLAGS,
-		.invoke_command_entry_point = invoke_command);
+		   .flags = PTA_DEFAULT_FLAGS,
+		   .invoke_command_entry_point = invoke_command);

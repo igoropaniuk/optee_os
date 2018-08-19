@@ -51,7 +51,7 @@ const char *rootUnitNameECC = "Attestation ECC root CA";
 const char *rootName = "Android";
 const char *attestationName = "Android Keystore Key";
 
-ULONG version = 2;	/* x509 version of cert. v3 used. */
+u64 version = 2;	/* x509 version of cert. v3 used. */
 const ULONG versionTag;	/* tag value for version field. */
 const ULONG serialNumber = 1;	/* serialNumber of cert. */
 const ULONG km_version = 3; /* keymaster version */
