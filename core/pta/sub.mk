@@ -10,5 +10,6 @@ endif
 srcs-$(CFG_WITH_STATS) += stats.c
 srcs-$(CFG_SYSTEM_PTA) += system.c
 srcs-$(CFG_NXP_SE05X) += scp03.c
+srcs-$(CFG_FIOVB_PTA) += fiovb.c
 
 subdirs-y += bcm
