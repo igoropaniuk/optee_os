@@ -3,6 +3,10 @@ srcs-y += main.c imx-common.c
 
 srcs-$(CFG_MX6)$(CFG_MX7) += imx_src.c mmdc.c
 
+ifneq (,$(filter y, $(CFG_MX8MM) $(CFG_MX8MN)))
+srcs-y += imx_sip_caller.c
+endif
+
 srcs-$(CFG_PL310) += imx_pl310.c
 ifeq ($(CFG_PSCI_ARM32),y)
 $(call force,CFG_PM_ARM32,y)
