@@ -8,6 +8,7 @@
 
 #include <string.h>
 #include <util.h>
+#include <fiovb_pta.h>
 
 #define DEFAULT_LOCK_STATE	0
 
@@ -206,6 +207,50 @@ static TEE_Result delete_persist_value(uint32_t pt,
 	return res;
 }
 
+static TEE_Result secondary_boot(uint32_t cmd, uint32_t pt,
+				 TEE_Param params[TEE_NUM_PARAMS])
+{
+	static const TEE_UUID fiovb_pta_uuid = PTA_FIOVB_UUID;
+	TEE_Result res = TEE_ERROR_GENERIC;
+	TEE_TASessionHandle sess = TEE_HANDLE_NULL;
+	uint32_t ret_orig = 0;
+	uint32_t cmd_pta;
+	const uint32_t exp_pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_INOUT,
+						TEE_PARAM_TYPE_NONE,
+						TEE_PARAM_TYPE_NONE,
+						TEE_PARAM_TYPE_NONE);
+
+	if (pt != exp_pt)
+		return TEE_ERROR_BAD_PARAMETERS;
+
+	res = TEE_OpenTASession(&fiovb_pta_uuid, TEE_TIMEOUT_INFINITE, 0, NULL,
+				&sess, &ret_orig);
+	if (res != TEE_SUCCESS) {
+		EMSG(
+		"ta_entry_client_with_timeout: TEE_OpenTASession failed\n");
+		return res;
+	}
+
+	switch (cmd) {
+	case TA_FIOVB_CMD_SET_SECONDARY_BOOT:
+		cmd_pta = PTA_CMD_SET_SECONDARY_BOOT;
+		break;
+	case TA_FIOVB_CMD_IS_SECONDARY_BOOT:
+		cmd_pta = PTA_CMD_IS_SECONDARY_BOOT;
+		break;
+	default:
+		return TEE_ERROR_BAD_PARAMETERS;
+	}
+
+	res = TEE_InvokeTACommand(sess, TEE_TIMEOUT_INFINITE,
+				  cmd_pta, pt, params,
+				  &ret_orig);
+
+	TEE_CloseTASession(sess);
+
+	return res;
+}
+
 TEE_Result TA_CreateEntryPoint(void)
 {
 	return TEE_SUCCESS;
@@ -237,6 +282,9 @@ TEE_Result TA_InvokeCommandEntryPoint(void *sess __unused, uint32_t cmd,
 		return write_persist_value(pt, params);
 	case TA_FIOVB_CMD_DELETE_PERSIST_VALUE:
 		return delete_persist_value(pt, params);
+	case TA_FIOVB_CMD_SET_SECONDARY_BOOT:
+	case TA_FIOVB_CMD_IS_SECONDARY_BOOT:
+		return secondary_boot(cmd, pt, params);
 	default:
 		EMSG("Command ID 0x%x is not supported", cmd);
 		return TEE_ERROR_NOT_SUPPORTED;
