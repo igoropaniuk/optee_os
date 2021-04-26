@@ -7,6 +7,7 @@
 
 #define PSCI_VERSION_0_2		(0x00000002)
 #define PSCI_VERSION_1_0		(0x00010000)
+#define PSCI_VERSION_1_1		(0x00010001)
 #define PSCI_VERSION			PSCI_FN(0x00)
 #define PSCI_CPU_SUSPEND		PSCI_FN(0x01)
 #define PSCI_CPU_OFF			PSCI_FN(0x02)
@@ -26,8 +27,11 @@
 #define PSCI_PSCI_SET_SUSPEND_MODE	PSCI_FN(0x0f)
 #define PSCI_FN_STAT_RESIDENCY		PSCI_FN(0x10)
 #define PSCI_FN_STAT_COUNT		PSCI_FN(0x11)
+#define PSCI_SYSTEM_RESET2		PSCI_FN(0x12)
+#define PSCI_MEM_PROTECT		PSCI_FN(0x13)
+#define PSCI_MEM_CHK_RANGE		PSCI_FN(0x14)
 
-#define PSCI_NUM_CALLS			18
+#define PSCI_NUM_CALLS			21
 
 #define PSCI_AFFINITY_LEVEL_ON		0
 #define PSCI_AFFINITY_LEVEL_OFF		1
@@ -67,6 +71,9 @@ int psci_migrate_info_up_cpu(void);
 void psci_system_off(void);
 void psci_system_reset(void);
 int psci_features(uint32_t psci_fid);
+int psci_system_reset2(uint32_t reset_type, uint32_t cookie);
+int psci_mem_protect(uint32_t enable);
+int psci_mem_chk_range(uintptr_t base, uint32_t length);
 int psci_node_hw_state(uint32_t cpu_id, uint32_t power_level);
 int psci_system_suspend(uintptr_t entry, uint32_t context_id,
 			struct sm_nsec_ctx *nsec);
