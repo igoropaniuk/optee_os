@@ -22,6 +22,8 @@ srcs-$(CFG_PL310) += tee_l2cc_mutex.c
 srcs-$(CFG_ARM32_core) += thread_a32.S
 srcs-$(CFG_ARM64_core) += thread_a64.S
 srcs-y += thread.c
+
+srcs-$(CFG_ARM64_core) += smccc_call_a64.S
 ifeq ($(CFG_CORE_FFA),y)
 srcs-y += thread_spmc.c
 cppflags-thread_spmc.c-y += -DTEE_IMPL_GIT_SHA1=$(TEE_IMPL_GIT_SHA1)
