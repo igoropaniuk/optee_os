@@ -8,6 +8,7 @@
 #include <kernel/thread.h>
 #include <sm/pm.h>
 #include <sm/sm.h>
+#include <smccc.h>
 #include <types_ext.h>
 #include "thread_private.h"
 
@@ -122,4 +123,9 @@ DEFINES
 	       offsetof(struct boot_embdata, reloc_offset));
 	DEFINE(BOOT_EMBDATA_RELOC_LEN,
 	       offsetof(struct boot_embdata, reloc_len));
+#ifdef ARM64
+	/* struct smccc_res */
+	DEFINE(SMCCC_RES_X0_OFFS, offsetof(struct smccc_res, a0));
+	DEFINE(SMCCC_RES_X2_OFFS, offsetof(struct smccc_res, a2));
+#endif
 }
