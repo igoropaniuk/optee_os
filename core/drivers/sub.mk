@@ -36,6 +36,7 @@ srcs-$(CFG_CORE_SE05X) += scp03_pta.c
 srcs-$(CFG_CORE_SE05X) += se050_cert_pta.c
 srcs-$(CFG_RNG_PTA) += rng_pta.c
 srcs-$(CFG_IMX_RNGB) += imx_rngb.c
+srcs-$(CFG_ZYNQMP_PM) += zynqmp_pm.c
 
 subdirs-y += crypto
 subdirs-$(CFG_BNXT_FW) += bnxt
