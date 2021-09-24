@@ -10,6 +10,7 @@
 #include <console.h>
 #include <crypto/crypto.h>
 #include <initcall.h>
+#include <drivers/zynqmp_pm.h>
 #include <inttypes.h>
 #include <keep.h>
 #include <kernel/asan.h>
@@ -406,6 +407,8 @@ static void init_runtime(unsigned long pageable_part)
 	struct fobj *fobj = NULL;
 	uint8_t *paged_store = NULL;
 	uint8_t *hashes = NULL;
+	uint8_t arr[12];
+	TEE_Result ret = TEE_SUCCESS;
 
 	assert(pageable_size % SMALL_PAGE_SIZE == 0);
 	assert(embdata->total_len >= embdata->hashes_offset +
@@ -537,11 +540,25 @@ static void init_runtime(unsigned long pageable_part)
 			true);
 
 	print_pager_pool_size();
+
+	memset(arr, 0, 12);
+	ret = zynqmp_efuse_read(arr, 12, zynqmp_get_efuse_length(ZYNQMP_EFUSE_DNA),
+				ZYNQMP_NONPUF_EFUSE);
+	if (ret) {
+		EMSG("zynqmp_efuse_read failed, ret = %x\n", ret);
+	}
+
+	EMSG("DNA:");
+	for (int i = 0; i < 12; i++) {
+		EMSG("%d: %x\n", i, arr[i]);
+	}
 }
 #else
 
 static void init_runtime(unsigned long pageable_part __unused)
 {
+	uint8_t arr[12];
+	TEE_Result ret = TEE_SUCCESS;
 	init_asan();
 
 	/*
@@ -559,6 +576,18 @@ static void init_runtime(unsigned long pageable_part __unused)
 #endif
 
 	IMSG_RAW("\n");
+
+	memset(arr, 0, 12);
+	ret = zynqmp_efuse_read(arr, 12, zynqmp_get_efuse_length(ZYNQMP_EFUSE_DNA),
+				ZYNQMP_NONPUF_EFUSE);
+	if (ret) {
+		EMSG("zynqmp_efuse_read failed, ret = %x\n", ret);
+	}
+
+	EMSG("DNA:");
+	for (int i = 0; i < 12; i++) {
+		EMSG("%d: %x\n", i, arr[i]);
+	}
 }
 #endif
 
