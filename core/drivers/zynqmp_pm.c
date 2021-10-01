@@ -46,11 +46,11 @@ static uint32_t zynqmp_sip_call(uint32_t pm_api_id, uint32_t arg0,
 	struct smccc_res res = { };
 
 	smccc_smc(pm_api_id,
-		  ((uint64_t)arg1 << 32) | arg0,
-		  ((uint64_t)arg3 << 32) | arg2,
+		  reg_pair_to_64(arg1, arg0),
+		  reg_pair_to_64(arg3, arg2),
 		  0, 0, 0, 0, 0, &res);
 
-	if (payload && !res.a0)
+	if (payload)
 		*payload = res.a0 >> 32;
 
 	return res.a0;
@@ -65,8 +65,7 @@ static void *alloc_aligned_zeroed(size_t sz)
 	alloc_size = sz;
 	cacheline_size = dcache_get_line_size();
 
-	if (ADD_OVERFLOW(alloc_size, ROUNDUP(alloc_size, cacheline_size),
-			 &alloc_size))
+	if (ROUNDUP_OVERFLOW(alloc_size, cacheline_size, &alloc_size))
 		return NULL;
 
 	ptr = memalign(cacheline_size, alloc_size);
@@ -97,12 +96,12 @@ static TEE_Result efuse_op(enum efuse_op op, uint8_t *buf, size_t sz,
 	efuse = alloc_aligned_zeroed(sizeof(struct xilinx_efuse));
 	if (!efuse) {
 		ret = TEE_ERROR_OUT_OF_MEMORY;
-		goto alloc_error;
+		goto out;
 	}
 
 	memcpy(buf_aligned, buf, sz);
 
-	efuse->src = (uint64_t)virt_to_phys(buf_aligned);
+	efuse->src = virt_to_phys(buf_aligned);
 	efuse->size = sz / sizeof(uint32_t);
 	efuse->offset = efuse_offset;
 	efuse->flag = op;
@@ -125,13 +124,16 @@ static TEE_Result efuse_op(enum efuse_op op, uint8_t *buf, size_t sz,
 
 		ret = TEE_ERROR_GENERIC;
 	} else {
-		if (op == EFUSE_READ)
+		if (op == EFUSE_READ) {
+			cache_operation(TEE_CACHEINVALIDATE, buf_aligned,
+					sz);
 			memcpy(buf, buf_aligned, sz);
+		}
 	}
 
 	free(efuse);
 
-alloc_error:
+out:
 	free(buf_aligned);
 
 	return ret;
