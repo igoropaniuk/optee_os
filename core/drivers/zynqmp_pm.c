@@ -6,6 +6,7 @@
 #include <arm.h>
 #include <drivers/zynqmp_pm.h>
 #include <kernel/cache_helpers.h>
+#include <kernel/thread.h>
 #include <mm/core_memprot.h>
 #include <smccc.h>
 #include <string.h>
@@ -43,17 +44,18 @@ static uint32_t zynqmp_sip_call(uint32_t pm_api_id, uint32_t arg0,
 				uint32_t arg1, uint32_t arg2, uint32_t arg3,
 				uint32_t *payload)
 {
-	struct smccc_res res = { };
+	struct thread_smc_args args = {
+		.a0 = pm_api_id,
+		.a1 = reg_pair_to_64(arg1, arg0),
+		.a2 = reg_pair_to_64(arg3, arg2),
+	};
 
-	smccc_smc(pm_api_id,
-		  reg_pair_to_64(arg1, arg0),
-		  reg_pair_to_64(arg3, arg2),
-		  0, 0, 0, 0, 0, &res);
+	thread_smccc(&args);
 
 	if (payload)
-		*payload = res.a0 >> 32;
+		*payload = args.a0 >> 32;
 
-	return res.a0;
+	return args.a0;
 }
 
 static void *alloc_aligned_zeroed(size_t sz)
